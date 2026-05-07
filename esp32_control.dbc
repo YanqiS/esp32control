@@ -1,0 +1,58 @@
+VERSION "ESP32 control CAN protocol v1"
+
+NS_ :
+	NS_DESC_
+	CM_
+	BA_DEF_
+	BA_
+	VAL_
+	CAT_DEF_
+	CAT_
+	FILTER
+	BA_DEF_DEF_
+	EV_DATA_
+	ENVVAR_DATA_
+	SGTYPE_
+	SGTYPE_VAL_
+	BA_DEF_SGTYPE_
+	BA_SGTYPE_
+	SIG_TYPE_REF_
+	VAL_TABLE_
+	SIG_GROUP_
+	SIG_VALTYPE_
+	SIGTYPE_VALTYPE_
+	BO_TX_BU_
+	BA_DEF_REL_
+	BA_REL_
+	BA_DEF_DEF_REL_
+	BU_SG_REL_
+	BU_EV_REL_
+	BU_BO_REL_
+	SG_MUL_VAL_
+
+BS_:
+
+BU_: STM32 CAN_TOOL
+
+BO_ 801 ESP32_Control: 8 CAN_TOOL
+ SG_ Target : 0|8@1+ (1,0) [0|2] "" STM32
+ SG_ Command : 8|8@1+ (1,0) [0|32] "" STM32
+ SG_ DurationMs : 16|16@1+ (1,0) [0|5000] "ms" STM32
+
+BO_ 802 ESP32_Status: 3 STM32
+ SG_ StatusCode : 0|8@1+ (1,0) [0|255] "" CAN_TOOL
+ SG_ Detail : 8|8@1+ (1,0) [0|255] "" CAN_TOOL
+ SG_ TickLow : 16|8@1+ (1,0) [0|255] "ms" CAN_TOOL
+
+CM_ BO_ 801 "CAN command frame received by STM32. StdId 0x321, DLC 8. Target selects ESP32-1, ESP32-2, or both; Command selects power or simulated key action; DurationMs is optional relay press time for key commands.";
+CM_ SG_ 801 Target "0=all ESP32 devices, 1=ESP32-1, 2=ESP32-2.";
+CM_ SG_ 801 Command "0x00 power off, 0x01 power on, 0x10 INCOME, 0x11 ANSWER, 0x12 HANGUP, 0x13 DIAL1, 0x14 DIAL2, 0x20 all relays off.";
+CM_ SG_ 801 DurationMs "Relay press duration for key commands. Firmware clamps it to 50..5000 ms; use 200 ms when unsure.";
+CM_ BO_ 802 "STM32 status response. StdId 0x322, DLC 3. Sent after a command is accepted or rejected.";
+CM_ SG_ 802 StatusCode "0x00 OK, 0xE1 DLC too short, 0xE2 invalid Target, 0xE3 invalid Command.";
+CM_ SG_ 802 Detail "For OK this echoes Command. For errors this contains the invalid/related value.";
+CM_ SG_ 802 TickLow "Low 8 bits of HAL_GetTick when status was sent.";
+
+VAL_ 801 Target 0 "All" 1 "ESP32_1" 2 "ESP32_2";
+VAL_ 801 Command 0 "PowerOff" 1 "PowerOn" 16 "Income" 17 "Answer" 18 "Hangup" 19 "Dial1" 20 "Dial2" 32 "AllRelaysOff";
+VAL_ 802 StatusCode 0 "OK" 225 "DlcTooShort" 226 "InvalidTarget" 227 "InvalidCommand";
