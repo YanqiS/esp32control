@@ -10,9 +10,9 @@ This project uses two standard CAN frames to control the STM32 relay board and r
 ## 板卡使用流程（精简版）
 
 1. **板卡上电**：外部电源生成 5V/3.3V，STM32 常供电启动；默认 ESP32 电源关闭、所有继电器释放。
-2. **STM32 初始化**：初始化系统时钟、GPIO、CAN、MOSFET 控制脚、继电器控制脚；CAN 工具/上位机设置为标准帧 125 kbit/s。
-3. **通过 CAN 打开 ESP32 电源**：上位机发送 `0x321` 控制帧，例如打开 ESP32-1：`01 01 00 00 00 00 00 00`；STM32 拉低对应 P-MOS gate，使 `U1_VCC` 输出 3.3V。
-4. **等待 ESP32 就绪**：ESP32 上电后建议等待 3~5 秒，用于系统启动、蓝牙和 Wi-Fi 初始化；期间可监听 STM32 回复的 `0x322` 状态帧确认命令已被接收。
+2. **STM32 初始化**：初始化系统时钟、GPIO、CAN、OLED、MOSFET 控制脚、继电器控制脚和 `K1CHECK/K2CHECK` 输入；OLED 会显示 ESP1/ESP2 的 PWR 和 CHECK 状态，CAN 工具/上位机设置为标准帧 125 kbit/s。
+3. **通过 CAN 打开 ESP32 电源**：上位机发送 `0x321` 控制帧，例如打开 ESP32-1：`01 01 00 00 00 00 00 00`；STM32 拉低对应 P-MOS gate，使 `U1_VCC` 输出 3.3V，OLED 上 ESP1 的 `PWR` 显示为 `ON`。
+4. **等待 ESP32 就绪**：ESP32 上电后建议等待 3~5 秒，用于系统启动、蓝牙和 Wi-Fi 初始化；期间可监听 STM32 回复的 `0x322` 状态帧确认命令已被接收，并通过 OLED 上的 `CHECK:HI/LO` 实时观察 ESP32 状态脚。
 5. **建立蓝牙连接**：车机搜索并连接 ESP32 模拟设备，连接完成后 ESP32 进入蓝牙电话模拟待命状态。
 6. **通过 CAN 触发按键继电器**：上位机发送 `0x321` 按键命令，STM32 输出 GPIO，经 ULN2003 驱动继电器吸合；继电器触点把 ESP32 对应 GPIO 短接到 GND，ESP32 识别为按键按下。
 7. **ESP32 执行动作**：`INCOME` 模拟来电，`ANSWER` 接听，`HANGUP` 挂断，`DIAL1`/`DIAL2` 外拨预设号码；`DurationMs` 只控制继电器按下时间，推荐普通短按使用 200 ms。

@@ -35,6 +35,12 @@ typedef struct
 
 typedef struct
 {
+  GPIO_TypeDef *port;
+  uint16_t pin;
+} GpioInput_t;
+
+typedef struct
+{
   GpioOutput_t output;
   uint32_t releaseTick;
   bool active;
@@ -66,6 +72,11 @@ typedef enum
 #define MIN_KEY_PRESS_MS            50U
 #define MAX_KEY_PRESS_MS            5000U
 #define HEARTBEAT_INTERVAL_MS       500U
+#define OLED_REFRESH_INTERVAL_MS    500U
+#define OLED_I2C_ADDR               0x3CU
+#define OLED_WIDTH                  128U
+#define OLED_HEIGHT                 64U
+#define OLED_PAGES                  (OLED_HEIGHT / 8U)
 #define CAN_CMD_DEVICE_ALL          0U
 #define CAN_CMD_DEVICE_ESP1         1U
 #define CAN_CMD_DEVICE_ESP2         2U
@@ -112,8 +123,17 @@ static const GpioOutput_t espPowerOutputs[ESP_DEVICE_COUNT] = {
   [ESP_DEVICE_2] = {MOSFET2_GPIO_Port, MOSFET2_Pin},
 };
 
+static const GpioInput_t espCheckInputs[ESP_DEVICE_COUNT] = {
+  [ESP_DEVICE_1] = {K1CHECK_GPIO_Port, K1CHECK_Pin},
+  [ESP_DEVICE_2] = {K2CHECK_GPIO_Port, K2CHECK_Pin},
+};
+
 static uint8_t canRxData[8];
+static uint8_t oledBuffer[OLED_WIDTH * OLED_PAGES];
+static bool espPowerEnabled[ESP_DEVICE_COUNT];
+static bool espCheckActive[ESP_DEVICE_COUNT];
 static uint32_t lastHeartbeatTick;
+static uint32_t lastOledRefreshTick;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -124,11 +144,29 @@ static void MX_CAN_Init(void);
 static void App_Init(void);
 static void App_Task(void);
 static void Heartbeat_Task(void);
+static void EspStatus_Task(void);
+static void Oled_Task(void);
 static void Relay_Task(void);
 static void Relay_Set(RelayChannel_t *relay, GPIO_PinState state);
 static void Relay_Press(EspDevice_t device, EspKey_t key, uint32_t durationMs);
 static void All_Relays_Off(void);
 static void Esp_SetPower(EspDevice_t device, bool enabled);
+static bool Esp_IsCheckActive(EspDevice_t device);
+static void Oled_Init(void);
+static void Oled_RenderStatus(void);
+static void Oled_ClearBuffer(void);
+static void Oled_DrawText(uint8_t page, uint8_t column, const char *text);
+static void Oled_DrawChar(uint8_t page, uint8_t column, char c);
+static const uint8_t *Oled_GetFont(char c);
+static void Oled_Update(void);
+static void Oled_WriteCommand(uint8_t command);
+static void Oled_WriteData(const uint8_t *data, size_t length);
+static void SoftI2c_Start(void);
+static void SoftI2c_Stop(void);
+static bool SoftI2c_WriteByte(uint8_t data);
+static void SoftI2c_SetSda(GPIO_PinState state);
+static void SoftI2c_SetScl(GPIO_PinState state);
+static void SoftI2c_Delay(void);
 static void Can_Start(void);
 static void Can_ProcessRx(void);
 static void Can_HandleCommand(const uint8_t *data, uint8_t len);
@@ -295,7 +333,7 @@ static void MX_GPIO_Init(void)
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOB, K2ANSWER_Pin|K2HANGUP_Pin|K2DIAL1_Pin|K2DIAL2_Pin
                           |OLED_SDA_Pin|OLED_SCL_Pin|LED_B_Pin|LED_G_Pin
-                          |LED_R_Pin|K2CHECK_Pin|K1CHECK_Pin, GPIO_PIN_RESET);
+                          |LED_R_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pins : MOSFET1_Pin MOSFET2_Pin K1INCOME_Pin K1ANSWER_Pin
                            K1HANGUP_Pin K1DIAL1_Pin K1DIAL2_Pin K2INCOME_Pin */
@@ -324,9 +362,8 @@ static void MX_GPIO_Init(void)
 
   /*Configure GPIO pins : K2CHECK_Pin K1CHECK_Pin */
   GPIO_InitStruct.Pin = K2CHECK_Pin|K1CHECK_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_PULLDOWN;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
@@ -343,15 +380,22 @@ static void App_Init(void)
   HAL_GPIO_WritePin(LED_R_GPIO_Port, LED_R_Pin, GPIO_PIN_RESET);
   HAL_GPIO_WritePin(LED_G_GPIO_Port, LED_G_Pin, GPIO_PIN_RESET);
   HAL_GPIO_WritePin(LED_B_GPIO_Port, LED_B_Pin, GPIO_PIN_RESET);
+  EspStatus_Task();
   lastHeartbeatTick = HAL_GetTick();
+  lastOledRefreshTick = HAL_GetTick();
+  Oled_Init();
+  Oled_RenderStatus();
+  Oled_Update();
   Can_Start();
 }
 
 static void App_Task(void)
 {
   Heartbeat_Task();
+  EspStatus_Task();
   Relay_Task();
   Can_ProcessRx();
+  Oled_Task();
 }
 
 static void Heartbeat_Task(void)
@@ -435,6 +479,235 @@ static void Esp_SetPower(EspDevice_t device, bool enabled)
   HAL_GPIO_WritePin(espPowerOutputs[device].port,
                     espPowerOutputs[device].pin,
                     enabled ? GPIO_PIN_RESET : GPIO_PIN_SET);
+  espPowerEnabled[device] = enabled;
+}
+
+static bool Esp_IsCheckActive(EspDevice_t device)
+{
+  if (device >= ESP_DEVICE_COUNT)
+  {
+    return false;
+  }
+
+  return (HAL_GPIO_ReadPin(espCheckInputs[device].port,
+                           espCheckInputs[device].pin) == GPIO_PIN_SET);
+}
+
+static void EspStatus_Task(void)
+{
+  for (uint8_t device = 0U; device < ESP_DEVICE_COUNT; device++)
+  {
+    espCheckActive[device] = Esp_IsCheckActive((EspDevice_t)device);
+  }
+}
+
+static void Oled_Task(void)
+{
+  const uint32_t now = HAL_GetTick();
+
+  if ((now - lastOledRefreshTick) >= OLED_REFRESH_INTERVAL_MS)
+  {
+    lastOledRefreshTick = now;
+    Oled_RenderStatus();
+    Oled_Update();
+  }
+}
+
+static void Oled_Init(void)
+{
+  static const uint8_t initCommands[] = {
+    0xAE, 0x20, 0x00, 0xB0, 0xC8, 0x00, 0x10, 0x40,
+    0x81, 0x7F, 0xA1, 0xA6, 0xA8, 0x3F, 0xA4, 0xD3,
+    0x00, 0xD5, 0x80, 0xD9, 0xF1, 0xDA, 0x12, 0xDB,
+    0x40, 0x8D, 0x14, 0xAF,
+  };
+
+  SoftI2c_SetSda(GPIO_PIN_SET);
+  SoftI2c_SetScl(GPIO_PIN_SET);
+  HAL_Delay(20U);
+
+  for (size_t i = 0U; i < sizeof(initCommands); i++)
+  {
+    Oled_WriteCommand(initCommands[i]);
+  }
+}
+
+static void Oled_RenderStatus(void)
+{
+  Oled_ClearBuffer();
+  Oled_DrawText(0U, 0U, "ESP32 CONTROL");
+  Oled_DrawText(2U, 0U, espPowerEnabled[ESP_DEVICE_1] ? "E1 PWR:ON" : "E1 PWR:OFF");
+  Oled_DrawText(3U, 0U, espCheckActive[ESP_DEVICE_1] ? "E1 CHECK:HI" : "E1 CHECK:LO");
+  Oled_DrawText(5U, 0U, espPowerEnabled[ESP_DEVICE_2] ? "E2 PWR:ON" : "E2 PWR:OFF");
+  Oled_DrawText(6U, 0U, espCheckActive[ESP_DEVICE_2] ? "E2 CHECK:HI" : "E2 CHECK:LO");
+}
+
+static void Oled_ClearBuffer(void)
+{
+  for (size_t i = 0U; i < sizeof(oledBuffer); i++)
+  {
+    oledBuffer[i] = 0x00U;
+  }
+}
+
+static void Oled_DrawText(uint8_t page, uint8_t column, const char *text)
+{
+  while ((*text != '\0') && (column < (OLED_WIDTH - 5U)))
+  {
+    Oled_DrawChar(page, column, *text);
+    column = (uint8_t)(column + 6U);
+    text++;
+  }
+}
+
+static void Oled_DrawChar(uint8_t page, uint8_t column, char c)
+{
+  const uint8_t *font = Oled_GetFont(c);
+  const size_t offset = ((size_t)page * OLED_WIDTH) + column;
+
+  if ((page >= OLED_PAGES) || ((column + 5U) > OLED_WIDTH))
+  {
+    return;
+  }
+
+  for (uint8_t i = 0U; i < 5U; i++)
+  {
+    oledBuffer[offset + i] = font[i];
+  }
+}
+
+static const uint8_t *Oled_GetFont(char c)
+{
+  static const uint8_t space[5] = {0x00, 0x00, 0x00, 0x00, 0x00};
+  static const uint8_t colon[5] = {0x00, 0x36, 0x36, 0x00, 0x00};
+  static const uint8_t zero[5] = {0x3E, 0x51, 0x49, 0x45, 0x3E};
+  static const uint8_t one[5] = {0x00, 0x42, 0x7F, 0x40, 0x00};
+  static const uint8_t two[5] = {0x42, 0x61, 0x51, 0x49, 0x46};
+  static const uint8_t three[5] = {0x21, 0x41, 0x45, 0x4B, 0x31};
+  static const uint8_t a[5] = {0x7E, 0x11, 0x11, 0x11, 0x7E};
+  static const uint8_t c[5] = {0x3E, 0x41, 0x41, 0x41, 0x22};
+  static const uint8_t e[5] = {0x7F, 0x49, 0x49, 0x49, 0x41};
+  static const uint8_t f[5] = {0x7F, 0x09, 0x09, 0x09, 0x01};
+  static const uint8_t h[5] = {0x7F, 0x08, 0x08, 0x08, 0x7F};
+  static const uint8_t i[5] = {0x00, 0x41, 0x7F, 0x41, 0x00};
+  static const uint8_t k[5] = {0x7F, 0x08, 0x14, 0x22, 0x41};
+  static const uint8_t l[5] = {0x7F, 0x40, 0x40, 0x40, 0x40};
+  static const uint8_t n[5] = {0x7F, 0x04, 0x08, 0x10, 0x7F};
+  static const uint8_t o[5] = {0x3E, 0x41, 0x41, 0x41, 0x3E};
+  static const uint8_t p[5] = {0x7F, 0x09, 0x09, 0x09, 0x06};
+  static const uint8_t r[5] = {0x7F, 0x09, 0x19, 0x29, 0x46};
+  static const uint8_t s[5] = {0x46, 0x49, 0x49, 0x49, 0x31};
+  static const uint8_t t[5] = {0x01, 0x01, 0x7F, 0x01, 0x01};
+  static const uint8_t w[5] = {0x7F, 0x20, 0x18, 0x20, 0x7F};
+
+  switch (c)
+  {
+    case '0': return zero;
+    case '1': return one;
+    case '2': return two;
+    case '3': return three;
+    case ':': return colon;
+    case 'A': return a;
+    case 'C': return c;
+    case 'E': return e;
+    case 'F': return f;
+    case 'H': return h;
+    case 'I': return i;
+    case 'K': return k;
+    case 'L': return l;
+    case 'N': return n;
+    case 'O': return o;
+    case 'P': return p;
+    case 'R': return r;
+    case 'S': return s;
+    case 'T': return t;
+    case 'W': return w;
+    default: return space;
+  }
+}
+
+static void Oled_Update(void)
+{
+  for (uint8_t page = 0U; page < OLED_PAGES; page++)
+  {
+    Oled_WriteCommand((uint8_t)(0xB0U + page));
+    Oled_WriteCommand(0x00U);
+    Oled_WriteCommand(0x10U);
+    Oled_WriteData(&oledBuffer[page * OLED_WIDTH], OLED_WIDTH);
+  }
+}
+
+static void Oled_WriteCommand(uint8_t command)
+{
+  SoftI2c_Start();
+  (void)SoftI2c_WriteByte((uint8_t)(OLED_I2C_ADDR << 1));
+  (void)SoftI2c_WriteByte(0x00U);
+  (void)SoftI2c_WriteByte(command);
+  SoftI2c_Stop();
+}
+
+static void Oled_WriteData(const uint8_t *data, size_t length)
+{
+  SoftI2c_Start();
+  (void)SoftI2c_WriteByte((uint8_t)(OLED_I2C_ADDR << 1));
+  (void)SoftI2c_WriteByte(0x40U);
+  for (size_t i = 0U; i < length; i++)
+  {
+    (void)SoftI2c_WriteByte(data[i]);
+  }
+  SoftI2c_Stop();
+}
+
+static void SoftI2c_Start(void)
+{
+  SoftI2c_SetSda(GPIO_PIN_SET);
+  SoftI2c_SetScl(GPIO_PIN_SET);
+  SoftI2c_SetSda(GPIO_PIN_RESET);
+  SoftI2c_SetScl(GPIO_PIN_RESET);
+}
+
+static void SoftI2c_Stop(void)
+{
+  SoftI2c_SetSda(GPIO_PIN_RESET);
+  SoftI2c_SetScl(GPIO_PIN_SET);
+  SoftI2c_SetSda(GPIO_PIN_SET);
+}
+
+static bool SoftI2c_WriteByte(uint8_t data)
+{
+  bool ack;
+
+  for (uint8_t mask = 0x80U; mask != 0U; mask >>= 1U)
+  {
+    SoftI2c_SetSda((data & mask) != 0U ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    SoftI2c_SetScl(GPIO_PIN_SET);
+    SoftI2c_SetScl(GPIO_PIN_RESET);
+  }
+
+  SoftI2c_SetSda(GPIO_PIN_SET);
+  SoftI2c_SetScl(GPIO_PIN_SET);
+  ack = (HAL_GPIO_ReadPin(OLED_SDA_GPIO_Port, OLED_SDA_Pin) == GPIO_PIN_RESET);
+  SoftI2c_SetScl(GPIO_PIN_RESET);
+  return ack;
+}
+
+static void SoftI2c_SetSda(GPIO_PinState state)
+{
+  HAL_GPIO_WritePin(OLED_SDA_GPIO_Port, OLED_SDA_Pin, state);
+  SoftI2c_Delay();
+}
+
+static void SoftI2c_SetScl(GPIO_PinState state)
+{
+  HAL_GPIO_WritePin(OLED_SCL_GPIO_Port, OLED_SCL_Pin, state);
+  SoftI2c_Delay();
+}
+
+static void SoftI2c_Delay(void)
+{
+  for (volatile uint8_t i = 0U; i < 20U; i++)
+  {
+  }
 }
 
 static void Can_Start(void)
