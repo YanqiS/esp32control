@@ -7,6 +7,7 @@
 #include "freertos/task.h"
 #include "freertos/timers.h"
 #include "driver/gpio.h"
+#include "driver/i2c.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "esp_event.h"
@@ -82,6 +83,17 @@
 // BOOT按键（保留，可手动重启蓝牙）
 #define BOOT_KEY GPIO_NUM_0
 
+// OLED显示屏（SSD1306 128x64，I2C）
+#define OLED_I2C_PORT       I2C_NUM_0
+#define OLED_SDA_PIN        GPIO_NUM_21
+#define OLED_SCL_PIN        GPIO_NUM_22
+#define OLED_I2C_FREQ_HZ    100000
+#define OLED_I2C_ADDR       0x3C
+#define OLED_WIDTH          128
+#define OLED_HEIGHT         64
+#define OLED_PAGES          (OLED_HEIGHT / 8)
+#define OLED_REFRESH_MS     500
+
 #define CNUM_PHONE_NUMBER "18621880000"  // 本机号码，不能和拨出号码重复，否则车机判定为VoIP
 
 // ========== 全局变量 ==========
@@ -96,6 +108,8 @@ static bool a2dp_connected = false;
 static bool avrcp_connected = false;
 static int negotiated_hfp_codec = -1;
 static bool timezone_inited = false;
+static bool oled_ready = false;
+static uint8_t oled_buffer[OLED_WIDTH * OLED_PAGES];
 
 // HFP连接状态
 static bool hfp_connected = false;
@@ -124,6 +138,17 @@ static call_direction_t current_call_direction = CALL_DIR_OUTGOING;
 // 外拨时 DIALING→ALERTING 的非阻塞定时器
 static TimerHandle_t dial_alerting_timer = NULL;
 static void dial_alerting_timer_callback(TimerHandle_t xTimer);
+static void oled_init(void);
+static void oled_task(void *arg);
+static void oled_render_status(void);
+static void oled_clear(void);
+static void oled_draw_text(uint8_t page, uint8_t column, const char *text);
+static void oled_draw_char(uint8_t page, uint8_t column, char c);
+static void oled_update(void);
+static void oled_write_command(uint8_t command);
+static void oled_write_data(const uint8_t *data, size_t length);
+static esp_err_t oled_write(uint8_t control, const uint8_t *data, size_t length);
+static const char *call_state_display_text(void);
  
 typedef struct
 {
@@ -2135,6 +2160,244 @@ static void heartbeat_task(void *arg)
     }
 }
 
+
+/* ===================== OLED 状态显示 ===================== */
+
+static void oled_init(void)
+{
+    i2c_config_t conf = {
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num = OLED_SDA_PIN,
+        .scl_io_num = OLED_SCL_PIN,
+        .sda_pullup_en = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = OLED_I2C_FREQ_HZ,
+    };
+
+    esp_err_t ret = i2c_param_config(OLED_I2C_PORT, &conf);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGW(TAG, "OLED I2C参数配置失败: %s", esp_err_to_name(ret));
+        return;
+    }
+
+    ret = i2c_driver_install(OLED_I2C_PORT, conf.mode, 0, 0, 0);
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE)
+    {
+        ESP_LOGW(TAG, "OLED I2C驱动安装失败: %s", esp_err_to_name(ret));
+        return;
+    }
+
+    static const uint8_t init_commands[] = {
+        0xAE, 0x20, 0x00, 0xB0, 0xC8, 0x00, 0x10, 0x40,
+        0x81, 0x7F, 0xA1, 0xA6, 0xA8, 0x3F, 0xA4, 0xD3,
+        0x00, 0xD5, 0x80, 0xD9, 0xF1, 0xDA, 0x12, 0xDB,
+        0x40, 0x8D, 0x14, 0xAF,
+    };
+
+    ret = oled_write(0x00, &init_commands[0], 1);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGW(TAG, "OLED未响应: %s", esp_err_to_name(ret));
+        return;
+    }
+
+    for (size_t i = 1; i < sizeof(init_commands); ++i)
+    {
+        oled_write_command(init_commands[i]);
+    }
+
+    oled_ready = true;
+    oled_render_status();
+    oled_update();
+    ESP_LOGI(TAG, "OLED状态屏已初始化: SDA=GPIO%d SCL=GPIO%d ADDR=0x%02X", OLED_SDA_PIN, OLED_SCL_PIN, OLED_I2C_ADDR);
+}
+
+static void oled_task(void *arg)
+{
+    (void)arg;
+
+    while (1)
+    {
+        if (oled_ready)
+        {
+            oled_render_status();
+            oled_update();
+        }
+        vTaskDelay(pdMS_TO_TICKS(OLED_REFRESH_MS));
+    }
+}
+
+static const char *call_state_display_text(void)
+{
+    if (!bt_on)
+    {
+        return "BT OFF";
+    }
+
+    if (!hfp_connected && current_call_state == CALL_STATE_IDLE)
+    {
+        return "WAIT HFP";
+    }
+
+    switch (current_call_state)
+    {
+    case CALL_STATE_INCOMING:
+        return "INCOMING";
+    case CALL_STATE_ACTIVE:
+        return "ACTIVE";
+    case CALL_STATE_DIALING:
+        return "DIALING";
+    case CALL_STATE_ALERTING:
+        return "ALERTING";
+    case CALL_STATE_IDLE:
+    default:
+        return "IDLE";
+    }
+}
+
+static void oled_render_status(void)
+{
+    char line[24];
+    const contact_t *income_contact = get_active_income_contact();
+    const contact_t *dial1_contact = get_active_dial1_contact();
+    const contact_t *dial2_contact = get_active_dial2_contact();
+
+    oled_clear();
+
+    snprintf(line, sizeof(line), "ESP%d BT PHONE", ESPNO);
+    oled_draw_text(0, 0, line);
+
+    oled_draw_text(1, 0, "STATE:");
+    oled_draw_text(2, 0, call_state_display_text());
+
+    if (current_phone_number[0] != '\0')
+    {
+        snprintf(line, sizeof(line), "NUM:%s", current_phone_number);
+    }
+    else
+    {
+        snprintf(line, sizeof(line), "NUM:NO CALL");
+    }
+    oled_draw_text(3, 0, line);
+
+    snprintf(line, sizeof(line), "IN:%s", income_contact->number);
+    oled_draw_text(5, 0, line);
+    snprintf(line, sizeof(line), "D1:%s", dial1_contact->number);
+    oled_draw_text(6, 0, line);
+    snprintf(line, sizeof(line), "D2:%s", dial2_contact->number);
+    oled_draw_text(7, 0, line);
+}
+
+static void oled_clear(void)
+{
+    memset(oled_buffer, 0, sizeof(oled_buffer));
+}
+
+static void oled_draw_text(uint8_t page, uint8_t column, const char *text)
+{
+    while (*text != '\0' && column < (OLED_WIDTH - 5))
+    {
+        oled_draw_char(page, column, *text);
+        column += 6;
+        ++text;
+    }
+}
+
+static void oled_draw_char(uint8_t page, uint8_t column, char c)
+{
+    uint8_t glyph[5] = {0, 0, 0, 0, 0};
+
+    switch (c)
+    {
+    case '0': { uint8_t g[5] = {0x3E,0x51,0x49,0x45,0x3E}; memcpy(glyph, g, 5); break; }
+    case '1': { uint8_t g[5] = {0x00,0x42,0x7F,0x40,0x00}; memcpy(glyph, g, 5); break; }
+    case '2': { uint8_t g[5] = {0x42,0x61,0x51,0x49,0x46}; memcpy(glyph, g, 5); break; }
+    case '3': { uint8_t g[5] = {0x21,0x41,0x45,0x4B,0x31}; memcpy(glyph, g, 5); break; }
+    case '4': { uint8_t g[5] = {0x18,0x14,0x12,0x7F,0x10}; memcpy(glyph, g, 5); break; }
+    case '5': { uint8_t g[5] = {0x27,0x45,0x45,0x45,0x39}; memcpy(glyph, g, 5); break; }
+    case '6': { uint8_t g[5] = {0x3C,0x4A,0x49,0x49,0x30}; memcpy(glyph, g, 5); break; }
+    case '7': { uint8_t g[5] = {0x01,0x71,0x09,0x05,0x03}; memcpy(glyph, g, 5); break; }
+    case '8': { uint8_t g[5] = {0x36,0x49,0x49,0x49,0x36}; memcpy(glyph, g, 5); break; }
+    case '9': { uint8_t g[5] = {0x06,0x49,0x49,0x29,0x1E}; memcpy(glyph, g, 5); break; }
+    case 'A': { uint8_t g[5] = {0x7E,0x11,0x11,0x11,0x7E}; memcpy(glyph, g, 5); break; }
+    case 'B': { uint8_t g[5] = {0x7F,0x49,0x49,0x49,0x36}; memcpy(glyph, g, 5); break; }
+    case 'C': { uint8_t g[5] = {0x3E,0x41,0x41,0x41,0x22}; memcpy(glyph, g, 5); break; }
+    case 'D': { uint8_t g[5] = {0x7F,0x41,0x41,0x22,0x1C}; memcpy(glyph, g, 5); break; }
+    case 'E': { uint8_t g[5] = {0x7F,0x49,0x49,0x49,0x41}; memcpy(glyph, g, 5); break; }
+    case 'F': { uint8_t g[5] = {0x7F,0x09,0x09,0x09,0x01}; memcpy(glyph, g, 5); break; }
+    case 'G': { uint8_t g[5] = {0x3E,0x41,0x49,0x49,0x7A}; memcpy(glyph, g, 5); break; }
+    case 'H': { uint8_t g[5] = {0x7F,0x08,0x08,0x08,0x7F}; memcpy(glyph, g, 5); break; }
+    case 'I': { uint8_t g[5] = {0x00,0x41,0x7F,0x41,0x00}; memcpy(glyph, g, 5); break; }
+    case 'L': { uint8_t g[5] = {0x7F,0x40,0x40,0x40,0x40}; memcpy(glyph, g, 5); break; }
+    case 'M': { uint8_t g[5] = {0x7F,0x02,0x0C,0x02,0x7F}; memcpy(glyph, g, 5); break; }
+    case 'N': { uint8_t g[5] = {0x7F,0x04,0x08,0x10,0x7F}; memcpy(glyph, g, 5); break; }
+    case 'O': { uint8_t g[5] = {0x3E,0x41,0x41,0x41,0x3E}; memcpy(glyph, g, 5); break; }
+    case 'P': { uint8_t g[5] = {0x7F,0x09,0x09,0x09,0x06}; memcpy(glyph, g, 5); break; }
+    case 'R': { uint8_t g[5] = {0x7F,0x09,0x19,0x29,0x46}; memcpy(glyph, g, 5); break; }
+    case 'S': { uint8_t g[5] = {0x46,0x49,0x49,0x49,0x31}; memcpy(glyph, g, 5); break; }
+    case 'T': { uint8_t g[5] = {0x01,0x01,0x7F,0x01,0x01}; memcpy(glyph, g, 5); break; }
+    case 'U': { uint8_t g[5] = {0x3F,0x40,0x40,0x40,0x3F}; memcpy(glyph, g, 5); break; }
+    case 'V': { uint8_t g[5] = {0x1F,0x20,0x40,0x20,0x1F}; memcpy(glyph, g, 5); break; }
+    case 'W': { uint8_t g[5] = {0x7F,0x20,0x18,0x20,0x7F}; memcpy(glyph, g, 5); break; }
+    case ':': { uint8_t g[5] = {0x00,0x36,0x36,0x00,0x00}; memcpy(glyph, g, 5); break; }
+    case '-': { uint8_t g[5] = {0x08,0x08,0x08,0x08,0x08}; memcpy(glyph, g, 5); break; }
+    case ' ':
+    default:
+        break;
+    }
+
+    if (page >= OLED_PAGES || column + 5 > OLED_WIDTH)
+    {
+        return;
+    }
+
+    memcpy(&oled_buffer[(page * OLED_WIDTH) + column], glyph, sizeof(glyph));
+}
+
+static void oled_update(void)
+{
+    for (uint8_t page = 0; page < OLED_PAGES; ++page)
+    {
+        oled_write_command((uint8_t)(0xB0 + page));
+        oled_write_command(0x00);
+        oled_write_command(0x10);
+        oled_write_data(&oled_buffer[page * OLED_WIDTH], OLED_WIDTH);
+    }
+}
+
+static void oled_write_command(uint8_t command)
+{
+    oled_write(0x00, &command, 1);
+}
+
+static void oled_write_data(const uint8_t *data, size_t length)
+{
+    oled_write(0x40, data, length);
+}
+
+static esp_err_t oled_write(uint8_t control, const uint8_t *data, size_t length)
+{
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    if (cmd == NULL)
+    {
+        return ESP_ERR_NO_MEM;
+    }
+
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (OLED_I2C_ADDR << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, control, true);
+    if (length > 0)
+    {
+        i2c_master_write(cmd, (uint8_t *)data, length, true);
+    }
+    i2c_master_stop(cmd);
+
+    esp_err_t ret = i2c_master_cmd_begin(OLED_I2C_PORT, cmd, pdMS_TO_TICKS(100));
+    i2c_cmd_link_delete(cmd);
+    return ret;
+}
+
 /* ===================== 主函数 ===================== */
 
 void app_main(void)
@@ -2170,6 +2433,9 @@ void app_main(void)
     ESP_LOGI(TAG, "  PIN码: 1234");
     ESP_LOGI(TAG, "========================================");
     ESP_LOGI(TAG, "");
+
+    // 初始化OLED状态显示
+    oled_init();
 
     // 初始化LED
     gpio_reset_pin(LED_R);
@@ -2214,6 +2480,7 @@ void app_main(void)
     xTaskCreate(led_task, "led", 2048, NULL, 5, NULL);
     xTaskCreate(button_task, "button", 4096, NULL, 5, NULL);
     xTaskCreate(heartbeat_task, "heartbeat", 1024, NULL, 3, NULL);
+    xTaskCreate(oled_task, "oled", 3072, NULL, 3, NULL);
 
     esp_err_t ret_bt = start_bt_phone();
     if (ret_bt != ESP_OK)
