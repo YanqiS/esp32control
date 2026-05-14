@@ -2273,7 +2273,7 @@ static void oled_render_status(void)
 
     if (current_phone_number[0] != '\0')
     {
-        snprintf(line, sizeof(line), "NUM:%s", current_phone_number);
+        snprintf(line, sizeof(line), "NUM:%.19s", current_phone_number);
     }
     else
     {
@@ -2281,11 +2281,11 @@ static void oled_render_status(void)
     }
     oled_draw_text(3, 0, line);
 
-    snprintf(line, sizeof(line), "IN:%s", income_contact->number);
+    snprintf(line, sizeof(line), "IN:%.20s", income_contact->number);
     oled_draw_text(5, 0, line);
-    snprintf(line, sizeof(line), "D1:%s", dial1_contact->number);
+    snprintf(line, sizeof(line), "D1:%.20s", dial1_contact->number);
     oled_draw_text(6, 0, line);
-    snprintf(line, sizeof(line), "D2:%s", dial2_contact->number);
+    snprintf(line, sizeof(line), "D2:%.20s", dial2_contact->number);
     oled_draw_text(7, 0, line);
 }
 
