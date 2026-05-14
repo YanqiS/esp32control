@@ -89,6 +89,7 @@
 #define OLED_SCL_PIN        GPIO_NUM_22
 #define OLED_I2C_FREQ_HZ    100000
 #define OLED_I2C_ADDR       0x3C
+#define OLED_I2C_ADDR_ALT   0x3D
 #define OLED_WIDTH          128
 #define OLED_HEIGHT         64
 #define OLED_PAGES          (OLED_HEIGHT / 8)
@@ -109,6 +110,7 @@ static bool avrcp_connected = false;
 static int negotiated_hfp_codec = -1;
 static bool timezone_inited = false;
 static bool oled_ready = false;
+static uint8_t oled_addr = OLED_I2C_ADDR;
 static uint8_t oled_buffer[OLED_WIDTH * OLED_PAGES];
 
 // HFP连接状态
@@ -148,6 +150,7 @@ static void oled_update(void);
 static void oled_write_command(uint8_t command);
 static void oled_write_data(const uint8_t *data, size_t length);
 static esp_err_t oled_write(uint8_t control, const uint8_t *data, size_t length);
+static esp_err_t oled_probe(uint8_t addr);
 static const char *call_state_display_text(void);
  
 typedef struct
@@ -2188,6 +2191,26 @@ static void oled_init(void)
         return;
     }
 
+    ret = oled_probe(OLED_I2C_ADDR);
+    if (ret == ESP_OK)
+    {
+        oled_addr = OLED_I2C_ADDR;
+    }
+    else
+    {
+        ret = oled_probe(OLED_I2C_ADDR_ALT);
+        if (ret == ESP_OK)
+        {
+            oled_addr = OLED_I2C_ADDR_ALT;
+        }
+        else
+        {
+            ESP_LOGW(TAG, "OLED未响应: SDA=GPIO%d SCL=GPIO%d ADDR=0x%02X/0x%02X err=%s",
+                     OLED_SDA_PIN, OLED_SCL_PIN, OLED_I2C_ADDR, OLED_I2C_ADDR_ALT, esp_err_to_name(ret));
+            return;
+        }
+    }
+
     static const uint8_t init_commands[] = {
         0xAE, 0x20, 0x00, 0xB0, 0xC8, 0x00, 0x10, 0x40,
         0x81, 0x7F, 0xA1, 0xA6, 0xA8, 0x3F, 0xA4, 0xD3,
@@ -2195,14 +2218,7 @@ static void oled_init(void)
         0x40, 0x8D, 0x14, 0xAF,
     };
 
-    ret = oled_write(0x00, &init_commands[0], 1);
-    if (ret != ESP_OK)
-    {
-        ESP_LOGW(TAG, "OLED未响应: %s", esp_err_to_name(ret));
-        return;
-    }
-
-    for (size_t i = 1; i < sizeof(init_commands); ++i)
+    for (size_t i = 0; i < sizeof(init_commands); ++i)
     {
         oled_write_command(init_commands[i]);
     }
@@ -2210,7 +2226,7 @@ static void oled_init(void)
     oled_ready = true;
     oled_render_status();
     oled_update();
-    ESP_LOGI(TAG, "OLED状态屏已初始化: SDA=GPIO%d SCL=GPIO%d ADDR=0x%02X", OLED_SDA_PIN, OLED_SCL_PIN, OLED_I2C_ADDR);
+    ESP_LOGI(TAG, "OLED状态屏已初始化: SDA=GPIO%d SCL=GPIO%d ADDR=0x%02X", OLED_SDA_PIN, OLED_SCL_PIN, oled_addr);
 }
 
 static void oled_task(void *arg)
@@ -2376,6 +2392,23 @@ static void oled_write_data(const uint8_t *data, size_t length)
     oled_write(0x40, data, length);
 }
 
+static esp_err_t oled_probe(uint8_t addr)
+{
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    if (cmd == NULL)
+    {
+        return ESP_ERR_NO_MEM;
+    }
+
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (addr << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_stop(cmd);
+
+    esp_err_t ret = i2c_master_cmd_begin(OLED_I2C_PORT, cmd, pdMS_TO_TICKS(100));
+    i2c_cmd_link_delete(cmd);
+    return ret;
+}
+
 static esp_err_t oled_write(uint8_t control, const uint8_t *data, size_t length)
 {
     i2c_cmd_handle_t cmd = i2c_cmd_link_create();
@@ -2385,7 +2418,7 @@ static esp_err_t oled_write(uint8_t control, const uint8_t *data, size_t length)
     }
 
     i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (OLED_I2C_ADDR << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, (oled_addr << 1) | I2C_MASTER_WRITE, true);
     i2c_master_write_byte(cmd, control, true);
     if (length > 0)
     {
