@@ -44,10 +44,10 @@
 
 // ========== 引脚定义（新板卡：继电器/手动按键，低电平触发） ==========
 #define BTN_INCOME  GPIO_NUM_13   // 来电（继电器K1 / 手动按键SW1）
-#define BTN_ANSWER  GPIO_NUM_27   // 接听（继电器K2 / SW2）  
-#define BTN_HANGUP  GPIO_NUM_26   // 挂断（继电器K3 / SW3）
-#define BTN_DIAL1   GPIO_NUM_25   // 拨号1（继电器K4 / SW4）
-#define BTN_DIAL2   GPIO_NUM_33   // 拨号2（继电器K5 / SW5）
+#define BTN_ANSWER  GPIO_NUM_14   // 接听（继电器K2 / SW2）
+#define BTN_HANGUP  GPIO_NUM_27   // 挂断（继电器K3 / SW3）
+#define BTN_DIAL1   GPIO_NUM_26   // 拨号1（继电器K4 / SW4）
+#define BTN_DIAL2   GPIO_NUM_25   // 拨号2（继电器K5 / SW5）
 
 // LED指示灯（共阳接u1_vcc，低电平点亮）
 #define LED_R GPIO_NUM_4   // 红灯 - 通话中
@@ -2174,10 +2174,10 @@ void app_main(void)
     ESP_LOGI(TAG, "💡 上电后自动启动蓝牙，BOOT键可手动重启");
     ESP_LOGI(TAG, "💡 同时启动Wi-Fi：连接热点并广播 %s", WIFI_AP_SSID);
     ESP_LOGI(TAG, "💡 BTN_INCOME  (GPIO13) = 模拟来电");
-    ESP_LOGI(TAG, "💡 BTN_ANSWER  (GPIO27) = 接听");
-    ESP_LOGI(TAG, "💡 BTN_HANGUP  (GPIO26) = 挂断/拒接");
-    ESP_LOGI(TAG, "💡 BTN_DIAL1   (GPIO25) = 外拨 %s", DEFAULT_DIAL_NUMBER);
-    ESP_LOGI(TAG, "💡 BTN_DIAL2   (GPIO33) = 外拨 13501693774");
+    ESP_LOGI(TAG, "💡 BTN_ANSWER  (GPIO14) = 接听");
+    ESP_LOGI(TAG, "💡 BTN_HANGUP  (GPIO27) = 挂断/拒接");
+    ESP_LOGI(TAG, "💡 BTN_DIAL1   (GPIO26) = 外拨 %s", DEFAULT_DIAL_NUMBER);
+    ESP_LOGI(TAG, "💡 BTN_DIAL2   (GPIO25) = 外拨 13501693774");
     ESP_LOGI(TAG, "💡 HEARTBEAT   (GPIO2)  = 心跳输出给STM32");
     ESP_LOGI(TAG, "");
 }
