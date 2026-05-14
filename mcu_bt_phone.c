@@ -42,6 +42,28 @@
 #define WIFI_AP_CHANNEL    6
 #define WIFI_MAX_STA_CONN  4
 
+// ========== 设备选择 ==========
+// 同一份工程可分别烧录两块 ESP32：
+//   ESPNO=1：DIAL1/2 使用通讯录第1/2个联系人，INCOME 使用第3个联系人
+//   ESPNO=2：DIAL1/2 使用通讯录第4/5个联系人，INCOME 使用第6个联系人
+#ifndef ESPNO
+#define ESPNO 1
+#endif
+
+#if (ESPNO != 1) && (ESPNO != 2)
+#error "ESPNO must be 1 or 2"
+#endif
+
+#if ESPNO == 1
+#define ACTIVE_DIAL1_CONTACT_INDEX   0U
+#define ACTIVE_DIAL2_CONTACT_INDEX   1U
+#define ACTIVE_INCOME_CONTACT_INDEX  2U
+#else
+#define ACTIVE_DIAL1_CONTACT_INDEX   3U
+#define ACTIVE_DIAL2_CONTACT_INDEX   4U
+#define ACTIVE_INCOME_CONTACT_INDEX  5U
+#endif
+
 // ========== 引脚定义（新板卡：继电器/手动按键，低电平触发） ==========
 #define BTN_INCOME  GPIO_NUM_13   // 来电（继电器K1 / 手动按键SW1）
 #define BTN_ANSWER  GPIO_NUM_14   // 接听（继电器K2 / SW2）
@@ -60,7 +82,6 @@
 // BOOT按键（保留，可手动重启蓝牙）
 #define BOOT_KEY GPIO_NUM_0
 
-#define DEFAULT_DIAL_NUMBER "13800138000"
 #define CNUM_PHONE_NUMBER "18621880000"  // 本机号码，不能和拨出号码重复，否则车机判定为VoIP
 
 // ========== 全局变量 ==========
@@ -122,7 +143,34 @@ static const contact_t phonebook[] = {
     {"李四", "13501693774"},
     {"王五", "13600136000"},
     {"赵六", "13700137000"},
+    {"孙七", "13900139000"},
+    {"周八", "15000150000"},
 };
+
+static const contact_t *get_phonebook_contact(size_t index)
+{
+    if (index >= (sizeof(phonebook) / sizeof(phonebook[0])))
+    {
+        return &phonebook[0];
+    }
+
+    return &phonebook[index];
+}
+
+static const contact_t *get_active_dial1_contact(void)
+{
+    return get_phonebook_contact(ACTIVE_DIAL1_CONTACT_INDEX);
+}
+
+static const contact_t *get_active_dial2_contact(void)
+{
+    return get_phonebook_contact(ACTIVE_DIAL2_CONTACT_INDEX);
+}
+
+static const contact_t *get_active_income_contact(void)
+{
+    return get_phonebook_contact(ACTIVE_INCOME_CONTACT_INDEX);
+}
 
 enum { CALLLOG_MAX = 32 };
 
@@ -1970,8 +2018,9 @@ static void button_task(void *arg)
             vTaskDelay(pdMS_TO_TICKS(50));
             if (gpio_get_level(BTN_INCOME) == 0)
             {
-                ESP_LOGI(TAG, "📞 [按键] 触发模拟来电: %s", DEFAULT_DIAL_NUMBER);
-                simulate_incoming_call(DEFAULT_DIAL_NUMBER);
+                const contact_t *contact = get_active_income_contact();
+                ESP_LOGI(TAG, "📞 [按键] 触发模拟来电: %s %s", contact->name, contact->number);
+                simulate_incoming_call(contact->number);
                 while (gpio_get_level(BTN_INCOME) == 0)
                     vTaskDelay(pdMS_TO_TICKS(10));
                 vTaskDelay(pdMS_TO_TICKS(50));
@@ -2040,8 +2089,9 @@ static void button_task(void *arg)
             vTaskDelay(pdMS_TO_TICKS(50));
             if (gpio_get_level(BTN_DIAL1) == 0)
             {
-                ESP_LOGI(TAG, "📲 [按键] 触发外拨1: %s", DEFAULT_DIAL_NUMBER);
-                handle_call_dial(DEFAULT_DIAL_NUMBER);
+                const contact_t *contact = get_active_dial1_contact();
+                ESP_LOGI(TAG, "📲 [按键] 触发外拨1: %s %s", contact->name, contact->number);
+                handle_call_dial(contact->number);
                 while (gpio_get_level(BTN_DIAL1) == 0)
                     vTaskDelay(pdMS_TO_TICKS(10));
                 vTaskDelay(pdMS_TO_TICKS(50));
@@ -2054,8 +2104,9 @@ static void button_task(void *arg)
             vTaskDelay(pdMS_TO_TICKS(50));
             if (gpio_get_level(BTN_DIAL2) == 0)
             {
-                ESP_LOGI(TAG, "📲 [按键] 触发外拨2: 13501693774");
-                handle_call_dial("13501693774");
+                const contact_t *contact = get_active_dial2_contact();
+                ESP_LOGI(TAG, "📲 [按键] 触发外拨2: %s %s", contact->name, contact->number);
+                handle_call_dial(contact->number);
                 while (gpio_get_level(BTN_DIAL2) == 0)
                     vTaskDelay(pdMS_TO_TICKS(10));
                 vTaskDelay(pdMS_TO_TICKS(50));
@@ -2173,11 +2224,15 @@ void app_main(void)
     ESP_LOGI(TAG, "💡 系统就绪（新板卡：继电器/按键控制模式）");
     ESP_LOGI(TAG, "💡 上电后自动启动蓝牙，BOOT键可手动重启");
     ESP_LOGI(TAG, "💡 同时启动Wi-Fi：连接热点并广播 %s", WIFI_AP_SSID);
-    ESP_LOGI(TAG, "💡 BTN_INCOME  (GPIO13) = 模拟来电");
+    const contact_t *income_contact = get_active_income_contact();
+    const contact_t *dial1_contact = get_active_dial1_contact();
+    const contact_t *dial2_contact = get_active_dial2_contact();
+    ESP_LOGI(TAG, "💡 ESPNO=%d", ESPNO);
+    ESP_LOGI(TAG, "💡 BTN_INCOME  (GPIO13) = 模拟来电 %s %s", income_contact->name, income_contact->number);
     ESP_LOGI(TAG, "💡 BTN_ANSWER  (GPIO14) = 接听");
     ESP_LOGI(TAG, "💡 BTN_HANGUP  (GPIO27) = 挂断/拒接");
-    ESP_LOGI(TAG, "💡 BTN_DIAL1   (GPIO26) = 外拨 %s", DEFAULT_DIAL_NUMBER);
-    ESP_LOGI(TAG, "💡 BTN_DIAL2   (GPIO25) = 外拨 13501693774");
+    ESP_LOGI(TAG, "💡 BTN_DIAL1   (GPIO26) = 外拨 %s %s", dial1_contact->name, dial1_contact->number);
+    ESP_LOGI(TAG, "💡 BTN_DIAL2   (GPIO25) = 外拨 %s %s", dial2_contact->name, dial2_contact->number);
     ESP_LOGI(TAG, "💡 HEARTBEAT   (GPIO2)  = 心跳输出给STM32");
     ESP_LOGI(TAG, "");
 }
