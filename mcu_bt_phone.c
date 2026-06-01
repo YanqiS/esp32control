@@ -47,22 +47,27 @@
 // 同一份工程可分别烧录两块 ESP32：
 //   ESPNO=1：DIAL1/2 使用通讯录第1/2个联系人，INCOME 使用第3个联系人
 //   ESPNO=2：DIAL1/2 使用通讯录第4/5个联系人，INCOME 使用第6个联系人
+//   ESPNO=3：DIAL1/2/INCOME 使用单人模式联系人，PBAP 通讯录只显示该1人
 #ifndef ESPNO
 #define ESPNO 2
 #endif
 
-#if (ESPNO != 1) && (ESPNO != 2)
-#error "ESPNO must be 1 or 2"
+#if (ESPNO != 1) && (ESPNO != 2) && (ESPNO != 3)
+#error "ESPNO must be 1, 2, or 3"
 #endif
 
 #if ESPNO == 1
 #define ACTIVE_DIAL1_CONTACT_INDEX   0U
 #define ACTIVE_DIAL2_CONTACT_INDEX   1U
 #define ACTIVE_INCOME_CONTACT_INDEX  2U
-#else
+#elif ESPNO == 2
 #define ACTIVE_DIAL1_CONTACT_INDEX   3U
 #define ACTIVE_DIAL2_CONTACT_INDEX   4U
 #define ACTIVE_INCOME_CONTACT_INDEX  5U
+#else
+#define ACTIVE_DIAL1_CONTACT_INDEX   6U
+#define ACTIVE_DIAL2_CONTACT_INDEX   6U
+#define ACTIVE_INCOME_CONTACT_INDEX  6U
 #endif
 
 // ========== 引脚定义（新板卡：继电器/手动按键，低电平触发） ==========
@@ -173,6 +178,7 @@ static const contact_t phonebook[] = {
     {"赵六", "13700137000"},
     {"孙七", "13900139000"},
     {"周八", "15000150000"},
+    {"钱九", "15100151000"},
 };
 
 static const contact_t *get_phonebook_contact(size_t index)
@@ -183,6 +189,26 @@ static const contact_t *get_phonebook_contact(size_t index)
     }
 
     return &phonebook[index];
+}
+
+
+static size_t get_visible_phonebook_count(void)
+{
+#if ESPNO == 3
+    return 1U;
+#else
+    return sizeof(phonebook) / sizeof(phonebook[0]);
+#endif
+}
+
+static const contact_t *get_visible_phonebook_contact(size_t index)
+{
+#if ESPNO == 3
+    (void)index;
+    return get_phonebook_contact(ACTIVE_INCOME_CONTACT_INDEX);
+#else
+    return get_phonebook_contact(index);
+#endif
 }
 
 static const contact_t *get_active_dial1_contact(void)
@@ -1277,12 +1303,14 @@ static void pbap_tx_timer_cb(TimerHandle_t xTimer)
     }
 }
 
-// 生成全部联系人的 vCard 数据（format: 0x00=v2.1, 0x01=v3.0）
+// 生成当前模式可见联系人的 vCard 数据（format: 0x00=v2.1, 0x01=v3.0）
 static int build_phonebook_vcards(char *buf, int max_len, uint8_t format)
 {
     int off = 0;
     bool use_vcard30 = (format == 0x01);
-    for (size_t i = 0; i < sizeof(phonebook)/sizeof(phonebook[0]); i++) {
+    size_t visible_count = get_visible_phonebook_count();
+    for (size_t i = 0; i < visible_count; i++) {
+        const contact_t *contact = get_visible_phonebook_contact(i);
         int n = 0;
         if (use_vcard30) {
             // vCard 3.0 默认 UTF-8，避免携带部分车机不兼容的 CHARSET 参数
@@ -1293,7 +1321,7 @@ static int build_phonebook_vcards(char *buf, int max_len, uint8_t format)
                 "FN:%s\r\n"
                 "TEL;TYPE=CELL:%s\r\n"
                 "END:VCARD\r\n",
-                phonebook[i].name, phonebook[i].name, phonebook[i].number);
+                contact->name, contact->name, contact->number);
         } else {
             n = snprintf(buf + off, max_len - off,
                 "BEGIN:VCARD\r\n"
@@ -1302,7 +1330,7 @@ static int build_phonebook_vcards(char *buf, int max_len, uint8_t format)
                 "FN;CHARSET=UTF-8:%s\r\n"
                 "TEL;TYPE=CELL:%s\r\n"
                 "END:VCARD\r\n",
-                phonebook[i].name, phonebook[i].name, phonebook[i].number);
+                contact->name, contact->name, contact->number);
         }
         if (n < 0 || off + n >= max_len) break;
         off += n;
@@ -1382,10 +1410,12 @@ static int build_vcard_listing(char *buf, int max_len)
         "<?xml version=\"1.0\"?>\r\n"
         "<!DOCTYPE vcard-listing SYSTEM \"vcard-listing.dtd\">\r\n"
         "<vCard-listing version=\"1.0\">\r\n");
-    for (size_t i = 0; i < sizeof(phonebook)/sizeof(phonebook[0]); i++) {
+    size_t visible_count = get_visible_phonebook_count();
+    for (size_t i = 0; i < visible_count; i++) {
+        const contact_t *contact = get_visible_phonebook_contact(i);
         off += snprintf(buf + off, max_len - off,
             "<card handle=\"%d.vcf\" name=\"%s\"/>\r\n",
-            (int)(i + 1), phonebook[i].name);
+            (int)(i + 1), contact->name);
     }
     off += snprintf(buf + off, max_len - off, "</vCard-listing>\r\n");
     return off;
@@ -1588,7 +1618,7 @@ static void obex_handle_get(uint32_t handle, const uint8_t *data, uint16_t len)
 
     uint16_t pb_count = 0;
     if (requested_obj == PB_OBJ_PHONEBOOK) {
-        pb_count = (uint16_t)(sizeof(phonebook) / sizeof(phonebook[0]));
+        pb_count = (uint16_t)get_visible_phonebook_count();
     } else if (requested_obj == PB_OBJ_CCH) {
         pb_count = (uint16_t)(incoming_call_count + outgoing_call_count + missed_call_count);
     } else {
